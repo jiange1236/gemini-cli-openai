@@ -6,7 +6,7 @@ compatibility_flags = ["nodejs_compat"] # Required for the 'google-auth-library'
 
 # --- KV Namespaces ---
 kv_namespaces = [
-  { binding = "GEMINI_CLI_KV", id = "6c761101b4a34c089e6a123f2782c5fd" }
+  { binding = "GEMINI_CLI_KV", id = "f29e732dd60f4461bd1c232db9f1f8fe" }
 ]
 
 # --- Environment Variables ---
