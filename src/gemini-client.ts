@@ -1,9 +1,21 @@
-import { Env, StreamChunk, ReasoningData, UsageData, ChatMessage, MessageContent } from "./types";
+import {
+	Env,
+	StreamChunk,
+	ReasoningData,
+	UsageData,
+	ChatMessage,
+	MessageContent,
+	Tool,
+	ToolChoice,
+	GeminiFunctionCall
+} from "./types";
 import { AuthManager } from "./auth";
 import { CODE_ASSIST_ENDPOINT, CODE_ASSIST_API_VERSION } from "./config";
 import { REASONING_MESSAGES, REASONING_CHUNK_DELAY, THINKING_CONTENT_CHUNK_SIZE } from "./constants";
 import { geminiCliModels } from "./models";
 import { validateImageUrl } from "./utils/image-utils";
+import { GenerationConfigValidator } from "./helpers/generation-config-validator";
+import { AutoModelSwitchingHelper } from "./helpers/auto-model-switching";
 
 // Gemini API response types
 interface GeminiCandidate {
@@ -26,6 +38,17 @@ interface GeminiResponse {
 
 interface GeminiPart {
 	text?: string;
+	thought?: boolean; // For real thinking chunks from Gemini
+	functionCall?: {
+		name: string;
+		args: object;
+	};
+	functionResponse?: {
+		name: string;
+		response: {
+			result: string;
+		};
+	};
 	inlineData?: {
 		mimeType: string;
 		data: string;
@@ -64,10 +87,12 @@ export class GeminiApiClient {
 	private env: Env;
 	private authManager: AuthManager;
 	private projectId: string | null = null;
+	private autoSwitchHelper: AutoModelSwitchingHelper;
 
 	constructor(env: Env, authManager: AuthManager) {
 		this.env = env;
 		this.authManager = authManager;
+		this.autoSwitchHelper = new AutoModelSwitchingHelper(env);
 	}
 
 	/**
@@ -150,6 +175,47 @@ export class GeminiApiClient {
 	private messageToGeminiFormat(msg: ChatMessage): GeminiFormattedMessage {
 		const role = msg.role === "assistant" ? "model" : "user";
 
+		// Handle tool call results (tool role in OpenAI format)
+		if (msg.role === "tool") {
+			return {
+				role: "user",
+				parts: [
+					{
+						functionResponse: {
+							name: msg.tool_call_id || "unknown_function",
+							response: {
+								result: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content)
+							}
+						}
+					}
+				]
+			};
+		}
+
+		// Handle assistant messages with tool calls
+		if (msg.role === "assistant" && msg.tool_calls && msg.tool_calls.length > 0) {
+			const parts: GeminiPart[] = [];
+
+			// Add text content if present
+			if (typeof msg.content === "string" && msg.content.trim()) {
+				parts.push({ text: msg.content });
+			}
+
+			// Add function calls
+			for (const toolCall of msg.tool_calls) {
+				if (toolCall.type === "function") {
+					parts.push({
+						functionCall: {
+							name: toolCall.function.name,
+							args: JSON.parse(toolCall.function.arguments)
+						}
+					});
+				}
+			}
+
+			return { role: "model", parts };
+		}
+
 		if (typeof msg.content === "string") {
 			// Simple text message
 			return {
@@ -227,7 +293,27 @@ export class GeminiApiClient {
 	/**
 	 * Stream content from Gemini API.
 	 */
-	async *streamContent(modelId: string, systemPrompt: string, messages: ChatMessage[]): AsyncGenerator<StreamChunk> {
+	async *streamContent(
+		modelId: string,
+		systemPrompt: string,
+		messages: ChatMessage[],
+		options?: {
+			includeReasoning?: boolean;
+			thinkingBudget?: number;
+			tools?: Tool[];
+			tool_choice?: ToolChoice;
+			max_tokens?: number;
+			temperature?: number;
+			top_p?: number;
+			stop?: string | string[];
+			presence_penalty?: number;
+			frequency_penalty?: number;
+			seed?: number;
+			response_format?: {
+				type: "text" | "json_object";
+			};
+		}
+	): AsyncGenerator<StreamChunk> {
 		await this.authManager.initializeAuth();
 		const projectId = await this.discoverProjectId();
 
@@ -237,14 +323,41 @@ export class GeminiApiClient {
 			contents.unshift({ role: "user", parts: [{ text: systemPrompt }] });
 		}
 
-		// Check if this is a thinking model and if fake thinking is enabled
+		// Check if this is a thinking model and which thinking mode to use
 		const isThinkingModel = geminiCliModels[modelId]?.thinking || false;
+		const isRealThinkingEnabled = this.env.ENABLE_REAL_THINKING === "true";
 		const isFakeThinkingEnabled = this.env.ENABLE_FAKE_THINKING === "true";
 		const streamThinkingAsContent = this.env.STREAM_THINKING_AS_CONTENT === "true";
+		const includeReasoning = options?.includeReasoning || false;
 
-		// For thinking models, emit reasoning before the actual response (only if fake thinking is enabled)
+		const req = {
+			thinking_budget: options?.thinkingBudget,
+			tools: options?.tools,
+			tool_choice: options?.tool_choice,
+			max_tokens: options?.max_tokens,
+			temperature: options?.temperature,
+			top_p: options?.top_p,
+			stop: options?.stop,
+			presence_penalty: options?.presence_penalty,
+			frequency_penalty: options?.frequency_penalty,
+			seed: options?.seed,
+			response_format: options?.response_format
+		};
+
+		// Use the validation helper to create a proper generation config
+		const generationConfig = GenerationConfigValidator.createValidatedConfig(
+			modelId,
+			req,
+			isRealThinkingEnabled,
+			includeReasoning,
+			this.env
+		);
+
+		const { tools, toolConfig } = GenerationConfigValidator.createValidateTools(req);
+
+		// For thinking models with fake thinking (fallback when real thinking is not enabled or not requested)
 		let needsThinkingClose = false;
-		if (isThinkingModel && isFakeThinkingEnabled) {
+		if (isThinkingModel && isFakeThinkingEnabled && !includeReasoning) {
 			yield* this.generateReasoningOutput(modelId, messages, streamThinkingAsContent);
 			needsThinkingClose = streamThinkingAsContent; // Only need to close if we streamed as content
 		}
@@ -254,14 +367,19 @@ export class GeminiApiClient {
 			project: projectId,
 			request: {
 				contents: contents,
-				generationConfig: {
-					temperature: 0.7,
-					maxOutputTokens: 8192
-				}
+				generationConfig,
+				tools: tools,
+				toolConfig
 			}
 		};
 
-		yield* this.performStreamRequest(streamRequest, needsThinkingClose);
+		yield* this.performStreamRequest(
+			streamRequest,
+			needsThinkingClose,
+			false,
+			includeReasoning && streamThinkingAsContent,
+			modelId
+		);
 	}
 
 	/**
@@ -361,12 +479,14 @@ export class GeminiApiClient {
 	}
 
 	/**
-	 * Performs the actual stream request with retry logic for 401 errors.
+	 * Performs the actual stream request with retry logic for 401 errors and auto model switching for rate limits.
 	 */
 	private async *performStreamRequest(
 		streamRequest: unknown,
 		needsThinkingClose: boolean = false,
-		isRetry: boolean = false
+		isRetry: boolean = false,
+		realThinkingAsContent: boolean = false,
+		originalModel?: string
 	): AsyncGenerator<StreamChunk> {
 		const response = await fetch(`${CODE_ASSIST_ENDPOINT}/${CODE_ASSIST_API_VERSION}:streamGenerateContent?alt=sse`, {
 			method: "POST",
@@ -382,9 +502,41 @@ export class GeminiApiClient {
 				console.log("Got 401 error in stream request, clearing token cache and retrying...");
 				await this.authManager.clearTokenCache();
 				await this.authManager.initializeAuth();
-				yield* this.performStreamRequest(streamRequest, needsThinkingClose, true); // Retry once
+				yield* this.performStreamRequest(streamRequest, needsThinkingClose, true, realThinkingAsContent, originalModel); // Retry once
 				return;
 			}
+
+			// Handle rate limiting with auto model switching
+			if (this.autoSwitchHelper.isRateLimitStatus(response.status) && !isRetry && originalModel) {
+				const fallbackModel = this.autoSwitchHelper.getFallbackModel(originalModel);
+				if (fallbackModel && this.autoSwitchHelper.isEnabled()) {
+					console.log(
+						`Got ${response.status} error for model ${originalModel}, switching to fallback model: ${fallbackModel}`
+					);
+
+					// Create new request with fallback model
+					const fallbackRequest = {
+						...(streamRequest as Record<string, unknown>),
+						model: fallbackModel
+					};
+
+					// Add a notification chunk about the model switch
+					yield {
+						type: "text",
+						data: this.autoSwitchHelper.createSwitchNotification(originalModel, fallbackModel)
+					};
+
+					yield* this.performStreamRequest(
+						fallbackRequest,
+						needsThinkingClose,
+						true,
+						realThinkingAsContent,
+						originalModel
+					);
+					return;
+				}
+			}
+
 			const errorText = await response.text();
 			console.error(`[GeminiAPI] Stream request failed: ${response.status}`, errorText);
 			throw new Error(`Stream request failed: ${response.status}`);
@@ -395,21 +547,124 @@ export class GeminiApiClient {
 		}
 
 		let hasClosedThinking = false;
+		let hasStartedThinking = false;
+
 		for await (const jsonData of this.parseSSEStream(response.body)) {
 			const candidate = jsonData.response?.candidates?.[0];
-			if (candidate?.content?.parts?.[0]?.text) {
-				const content = candidate.content.parts[0].text;
 
-				// Close thinking tag before first real content if needed
-				if (needsThinkingClose && !hasClosedThinking) {
-					yield {
-						type: "thinking_content",
-						data: "\n</thinking>\n\n"
-					};
-					hasClosedThinking = true;
+			if (candidate?.content?.parts) {
+				for (const part of candidate.content.parts as GeminiPart[]) {
+					// Handle real thinking content from Gemini
+					if (part.thought === true && part.text) {
+						const thinkingText = part.text;
+
+						if (realThinkingAsContent) {
+							// Stream as content with <thinking> tags (DeepSeek R1 style)
+							if (!hasStartedThinking) {
+								yield {
+									type: "thinking_content",
+									data: "<thinking>\n"
+								};
+								hasStartedThinking = true;
+							}
+
+							yield {
+								type: "thinking_content",
+								data: thinkingText
+							};
+						} else {
+							// Stream as separate reasoning field
+							yield {
+								type: "real_thinking",
+								data: thinkingText
+							};
+						}
+					}
+					// Check if text content contains <think> tags (based on your original example)
+					else if (part.text && part.text.includes("<think>")) {
+						if (realThinkingAsContent) {
+							// Extract thinking content and convert to our format
+							const thinkingMatch = part.text.match(/<think>(.*?)<\/think>/s);
+							if (thinkingMatch) {
+								if (!hasStartedThinking) {
+									yield {
+										type: "thinking_content",
+										data: "<thinking>\n"
+									};
+									hasStartedThinking = true;
+								}
+
+								yield {
+									type: "thinking_content",
+									data: thinkingMatch[1]
+								};
+							}
+
+							// Extract any non-thinking coRecentent
+							const nonThinkingContent = part.text.replace(/<think>.*?<\/think>/gs, "").trim();
+							if (nonThinkingContent) {
+								if (hasStartedThinking && !hasClosedThinking) {
+									yield {
+										type: "thinking_content",
+										data: "\n</thinking>\n\n"
+									};
+									hasClosedThinking = true;
+								}
+								yield { type: "text", data: nonThinkingContent };
+							}
+						} else {
+							// Stream thinking as separate reasoning field
+							const thinkingMatch = part.text.match(/<think>(.*?)<\/think>/s);
+							if (thinkingMatch) {
+								yield {
+									type: "real_thinking",
+									data: thinkingMatch[1]
+								};
+							}
+
+							// Stream non-thinking content as regular text
+							const nonThinkingContent = part.text.replace(/<think>.*?<\/think>/gs, "").trim();
+							if (nonThinkingContent) {
+								yield { type: "text", data: nonThinkingContent };
+							}
+						}
+					}
+					// Handle regular content - only if it's not a thinking part and doesn't contain <think> tags
+					else if (part.text && !part.thought && !part.text.includes("<think>")) {
+						// Close thinking tag before first real content if needed
+						if ((needsThinkingClose || (realThinkingAsContent && hasStartedThinking)) && !hasClosedThinking) {
+							yield {
+								type: "thinking_content",
+								data: "\n</thinking>\n\n"
+							};
+							hasClosedThinking = true;
+						}
+
+						yield { type: "text", data: part.text };
+					}
+					// Handle function calls from Gemini
+					else if (part.functionCall) {
+						// Close thinking tag before function call if needed
+						if ((needsThinkingClose || (realThinkingAsContent && hasStartedThinking)) && !hasClosedThinking) {
+							yield {
+								type: "thinking_content",
+								data: "\n</thinking>\n\n"
+							};
+							hasClosedThinking = true;
+						}
+
+						const functionCallData: GeminiFunctionCall = {
+							name: part.functionCall.name,
+							args: part.functionCall.args
+						};
+
+						yield {
+							type: "tool_code",
+							data: functionCallData
+						};
+					}
+					// Note: Skipping unknown part structures
 				}
-
-				yield { type: "text", data: content };
 			}
 
 			if (jsonData.response?.usageMetadata) {
@@ -432,21 +687,75 @@ export class GeminiApiClient {
 	async getCompletion(
 		modelId: string,
 		systemPrompt: string,
-		messages: ChatMessage[]
-	): Promise<{ content: string; usage?: UsageData }> {
-		let content = "";
-		let usage: UsageData | undefined;
-
-		// Collect all chunks from the stream
-		for await (const chunk of this.streamContent(modelId, systemPrompt, messages)) {
-			if (chunk.type === "text" && typeof chunk.data === "string") {
-				content += chunk.data;
-			} else if (chunk.type === "usage" && typeof chunk.data === "object") {
-				usage = chunk.data as UsageData;
-			}
-			// Skip reasoning chunks for non-streaming responses
+		messages: ChatMessage[],
+		options?: {
+			includeReasoning?: boolean;
+			thinkingBudget?: number;
+			tools?: Tool[];
+			tool_choice?: ToolChoice;
+			max_tokens?: number;
+			temperature?: number;
+			top_p?: number;
+			stop?: string | string[];
+			presence_penalty?: number;
+			frequency_penalty?: number;
+			seed?: number;
+			response_format?: {
+				type: "text" | "json_object";
+			};
 		}
+	): Promise<{
+		content: string;
+		usage?: UsageData;
+		tool_calls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }>;
+	}> {
+		try {
+			let content = "";
+			let usage: UsageData | undefined;
+			const tool_calls: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> = [];
 
-		return { content, usage };
+			// Collect all chunks from the stream
+			for await (const chunk of this.streamContent(modelId, systemPrompt, messages, options)) {
+				if (chunk.type === "text" && typeof chunk.data === "string") {
+					content += chunk.data;
+				} else if (chunk.type === "usage" && typeof chunk.data === "object") {
+					usage = chunk.data as UsageData;
+				} else if (chunk.type === "tool_code" && typeof chunk.data === "object") {
+					const toolData = chunk.data as GeminiFunctionCall;
+					tool_calls.push({
+						id: `call_${crypto.randomUUID()}`,
+						type: "function",
+						function: {
+							name: toolData.name,
+							arguments: JSON.stringify(toolData.args)
+						}
+					});
+				}
+				// Skip reasoning chunks for non-streaming responses
+			}
+
+			return {
+				content,
+				usage,
+				tool_calls: tool_calls.length > 0 ? tool_calls : undefined
+			};
+		} catch (error: unknown) {
+			// Handle rate limiting for non-streaming requests
+			if (this.autoSwitchHelper.isRateLimitError(error)) {
+				const fallbackResult = await this.autoSwitchHelper.handleNonStreamingFallback(
+					modelId,
+					systemPrompt,
+					messages,
+					options,
+					this.streamContent.bind(this)
+				);
+				if (fallbackResult) {
+					return fallbackResult;
+				}
+			}
+
+			// Re-throw if not a rate limit error or fallback not available
+			throw error;
+		}
 	}
 }
